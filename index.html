@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>电池循环负载</title>
+<style>
+/* Layout idea: the fractal fills the screen; readouts sit in three quiet panels on top of it. */
+:root {
+  color-scheme: dark;
+  --ink: #0b1020;
+  --panel: rgba(11, 16, 32, 0.78);
+  --line: rgba(238, 240, 246, 0.16);
+  --text: #eef0f6;
+  --muted: #a3acc2;
+  --accent: #ffb454;
+  --ok: #7ad3a8;
+  --warn: #ff8a6b;
+  --sans: -apple-system, "PingFang SC", "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--ink);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.45;
+  overflow: hidden;
+}
+canvas {
+  position: fixed; inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  display: block;
+  background: var(--ink);
+}
+.hud {
+  position: fixed; inset: 0;
+  padding: 16px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto 1fr auto;
+  gap: 12px;
+  pointer-events: none;
+}
+.panel {
+  pointer-events: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+}
+.stats { grid-column: 1; grid-row: 1; justify-self: start; min-width: 220px; }
+.levels { grid-column: 2; grid-row: 1; align-self: start; }
+.log { grid-column: 1 / -1; grid-row: 3; justify-self: start; width: min(100%, 460px); }
+
+.label { color: var(--muted); font-size: 12px; letter-spacing: 0.04em; }
+.clock {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 40px;
+  line-height: 1.1;
+  margin: 2px 0 8px;
+}
+.rows { display: grid; grid-template-columns: auto 1fr; gap: 2px 14px; margin: 0; }
+.rows dt { color: var(--muted); }
+.rows dd { margin: 0; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  margin-top: 10px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 13px;
+}
+.pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.pill[data-state="ok"]::before { background: var(--ok); }
+.pill[data-state="max"]::before { background: var(--accent); }
+.pill[data-state="bad"]::before { background: var(--warn); }
+
+.seg { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+button {
+  font: inherit;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 14px;
+  min-height: 36px;
+  cursor: pointer;
+}
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #1a1204; font-weight: 600; }
+
+.log-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.log-actions { display: flex; gap: 6px; }
+.log-actions button { padding: 4px 10px; min-height: 30px; font-size: 13px; }
+table { width: 100%; border-collapse: collapse; margin-top: 8px; font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; }
+th { text-align: left; color: var(--muted); font-weight: 400; font-family: var(--sans); font-size: 12px; padding: 0 8px 4px 0; }
+td { padding: 3px 8px 3px 0; border-top: 1px solid var(--line); white-space: nowrap; }
+tr.now td { color: var(--accent); }
+.note { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+textarea {
+  width: 100%; height: 110px; margin-top: 8px;
+  background: var(--ink); color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px;
+  font-family: var(--mono); font-size: 12px; padding: 8px;
+}
+[hidden] { display: none !important; }
+
+@media (max-width: 520px) {
+  .hud { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto 1fr auto; }
+  .stats, .levels { grid-column: 1; justify-self: stretch; }
+  .levels { grid-row: 2; }
+  .log { grid-row: 4; }
+  .clock { font-size: 32px; }
+}
+</style>
+</head>
+<body>
+<canvas id="gl" aria-label="持续渲染的分形图形，用来产生固定的耗电负荷"></canvas>
+
+<div class="hud">
+  <section class="panel stats" aria-live="off">
+    <div class="label">本轮已运行</div>
+    <div class="clock" id="clock">0:00:00</div>
+    <dl class="rows">
+      <dt>开始</dt><dd id="started">--</dd>
+      <dt>速度</dt><dd id="fps">-- / --</dd>
+      <dt>画面</dt><dd id="res">--</dd>
+      <dt>运算线程</dt><dd id="cpu">--</dd>
+    </dl>
+    <div class="pill" id="state" data-state="">正在启动</div>
+  </section>
+
+  <section class="panel levels">
+    <div class="label">负荷档位</div>
+    <div class="seg" role="group" aria-label="负荷档位">
+      <button type="button" id="lv-low" data-level="low" aria-pressed="false">低</button>
+      <button type="button" id="lv-mid" data-level="mid" aria-pressed="false">中</button>
+      <button type="button" id="lv-high" data-level="high" aria-pressed="false">高</button>
+      <button type="button" id="lv-max" data-level="max" aria-pressed="false">全力</button>
+    </div>
+  </section>
+
+  <section class="panel log">
+    <div class="log-head">
+      <div class="label">运行记录（最近 5 轮）</div>
+      <div class="log-actions">
+        <button type="button" id="copy">复制全部记录</button>
+        <button type="button" id="clear">清空</button>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>开始</th><th>时长</th><th>档位</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <textarea id="dump" hidden readonly aria-label="全部运行记录"></textarea>
+    <p class="note" id="note">打开页面就开始运行。记录只存在这台设备的这个浏览器里。</p>
+  </section>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // Each level is a fixed amount of work: fixed picture size, fixed detail, fixed frame rate.
+  var LEVELS = {
+    low:  { name: '低', w: 640,  h: 480, steps: 40, iter: 6,  fps: 30, workers: 0 },
+    mid:  { name: '中', w: 800,  h: 600, steps: 64, iter: 8,  fps: 30, workers: 2 },
+    high: { name: '高', w: 1280, h: 960, steps: 96, iter: 10, fps: 60, workers: 4 },
+    // No frame cap and no waiting for the screen: the picture is drawn in back-to-back batches,
+    // each batch sized from its measured time, so the graphics chip never idles on any device.
+    // Every processor core gets its own thread.
+    max:  { name: '全力', w: 1280, h: 960, steps: 96, iter: 10, fps: 0, workers: -1, burn: true }
+  };
+  var GAP_MS = 120000;      // a pause longer than this starts a new run
+  var BEAT_MS = 15000;      // how often the current run is saved
+  var KEEP_RUNS = 600;
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  // ---------- storage (works without it) ----------
+  var mem = {};
+  var store = {
+    get: function (k) {
+      try { var v = localStorage.getItem(k); return v === null ? mem[k] : v; } catch (e) { return mem[k]; }
+    },
+    set: function (k, v) {
+      mem[k] = v;
+      try { localStorage.setItem(k, v); return true; } catch (e) { return false; }
+    }
+  };
+  function loadRuns() {
+    try { var a = JSON.parse(store.get('runs') || '[]'); return Array.isArray(a) ? a : []; } catch (e) { return []; }
+  }
+  var runs = loadRuns();
+  var saved = true;
+  function saveRuns() {
+    if (runs.length > KEEP_RUNS) runs = runs.slice(runs.length - KEEP_RUNS);
+    saved = store.set('runs', JSON.stringify(runs));
+  }
+
+  // ---------- level ----------
+  function pickLevel() {
+    var h = (location.hash || '').replace('#', '');
+    if (LEVELS[h]) return h;
+    var s = store.get('level');
+    return LEVELS[s] ? s : 'max';
+  }
+  var levelKey = pickLevel();
+  var L = LEVELS[levelKey];
+
+  // ---------- run log ----------
+  var cur = null;
+  function startRun(now) {
+    cur = { start: now, last: now, level: levelKey };
+    runs.push(cur);
+    saveRuns();
+  }
+  function touchRun(now) {
+    if (!cur || now - cur.last > GAP_MS || cur.level !== levelKey) { startRun(now); return; }
+    cur.last = now;
+  }
+  (function resume() {
+    var now = Date.now();
+    var last = runs[runs.length - 1];
+    if (last && now - last.last <= GAP_MS && last.level === levelKey) { cur = last; cur.last = now; }
+    else startRun(now);
+  })();
+
+  // ---------- formatting ----------
+  function p2(n) { return (n < 10 ? '0' : '') + n; }
+  function dur(ms) {
+    var s = Math.max(0, Math.floor(ms / 1000));
+    return Math.floor(s / 3600) + ':' + p2(Math.floor(s / 60) % 60) + ':' + p2(s % 60);
+  }
+  function stamp(ms) {
+    var d = new Date(ms);
+    return p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes());
+  }
+  function fullStamp(ms) {
+    var d = new Date(ms);
+    return d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + ' ' +
+      p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
+  }
+  function csv() {
+    var out = ['开始时间,结束时间,时长(分钟),档位'];
+    runs.forEach(function (r) {
+      out.push([fullStamp(r.start), fullStamp(r.last), ((r.last - r.start) / 60000).toFixed(1), (LEVELS[r.level] || {}).name || r.level].join(','));
+    });
+    return out.join('\n');
+  }
+
+  // ---------- processor load: busy 80 ms out of every 100 ms per thread ----------
+  var workers = [];
+  function workerSrc(busy, rest) {
+    return 'function tick(){var end=performance.now()+' + busy + ',x=0;' +
+      'while(performance.now()<end){for(var i=0;i<20000;i++){x+=Math.sqrt(i*1.0001+(x%7));}}' +
+      'setTimeout(tick,' + rest + ');}tick();';
+  }
+  function setWorkers(n) {
+    var src = n < 0 ? workerSrc(190, 10) : workerSrc(80, 20);
+    if (n < 0) n = Math.max(2, navigator.hardwareConcurrency || 4);
+    workers.forEach(function (w) { try { w.terminate(); } catch (e) {} });
+    workers = [];
+    try {
+      var url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+      for (var i = 0; i < n; i++) workers.push(new Worker(url));
+    } catch (e) { /* page still works with the picture load alone */ }
+    $('cpu').textContent = workers.length + ' 个';
+  }
+
+  // ---------- picture load: a ray-marched fractal ----------
+  var canvas = $('gl');
+  var gl = null, prog = null, uRes = null, uAng = null, passes = 1;
+  var glError = '';
+
+  var VERT = 'attribute vec2 p;void main(){gl_Position=vec4(p,0.0,1.0);}';
+  function fragSource(steps, iter) {
+    return [
+      'precision highp float;',
+      'uniform vec2 uRes;',
+      'uniform vec3 uAng;',
+      'uniform float uAlpha;',
+      'const int STEPS=' + steps + ';',
+      'const int ITER=' + iter + ';',
+      'float de(vec3 pos,out float trap){',
+      '  vec3 z=pos;float dr=1.0;float r=length(z);trap=1e9;',
+      '  for(int i=0;i<ITER;i++){',
+      '    r=length(z);',
+      '    if(r>2.0)break;',
+      '    float th=acos(clamp(z.z/max(r,1e-6),-1.0,1.0))*8.0;',
+      '    float ph=atan(z.y,z.x)*8.0;',
+      '    float r7=pow(r,7.0);',
+      '    dr=r7*8.0*dr+1.0;',
+      '    z=r7*r*vec3(sin(th)*cos(ph),sin(th)*sin(ph),cos(th))+pos;',
+      '    trap=min(trap,dot(z,z));',
+      '  }',
+      '  return 0.5*log(max(r,1e-6))*r/dr;',
+      '}',
+      'void main(){',
+      '  vec2 uv=(gl_FragCoord.xy*2.0-uRes)/uRes.y;',
+      '  vec3 ro=vec3(2.5*cos(uAng.x),0.9*sin(uAng.y),2.5*sin(uAng.x));',
+      '  vec3 f=normalize(-ro);',
+      '  vec3 s=normalize(cross(f,vec3(0.0,1.0,0.0)));',
+      '  vec3 u=cross(s,f);',
+      '  vec3 rd=normalize(f*1.7+s*uv.x+u*uv.y);',
+      '  float t=0.0;float trap=0.0;float n=0.0;float hit=0.0;',
+      '  for(int i=0;i<STEPS;i++){',
+      '    float d=de(ro+rd*t,trap);',
+      '    if(d<0.0012*t){hit=1.0;break;}',
+      '    t+=d;n+=1.0;',
+      '    if(t>6.0)break;',
+      '  }',
+      '  vec3 col=mix(vec3(0.004,0.006,0.02),vec3(0.012,0.016,0.05),0.5+0.5*uv.y);',
+      '  if(hit>0.5){',
+      '    vec3 pos=ro+rd*t;float tr;float e=0.0015*t;',
+      '    vec2 k=vec2(1.0,-1.0);',
+      '    vec3 nor=normalize(k.xyy*de(pos+k.xyy*e,tr)+k.yyx*de(pos+k.yyx*e,tr)+k.yxy*de(pos+k.yxy*e,tr)+k.xxx*de(pos+k.xxx*e,tr));',
+      '    vec3 lig=normalize(vec3(cos(uAng.z),0.8,sin(uAng.z)));',
+      '    float dif=clamp(dot(nor,lig),0.0,1.0);',
+      '    float ao=1.0-n/float(STEPS);',
+      '    float m=clamp(sqrt(trap),0.0,1.0);',
+      '    vec3 base=mix(vec3(0.78,0.22,0.36),vec3(1.0,0.71,0.33),m);',
+      '    col=base*(0.22+0.78*dif)*(0.35+0.65*ao*ao);',
+      '    col+=vec3(1.0,0.9,0.75)*pow(clamp(dot(reflect(rd,nor),lig),0.0,1.0),24.0)*0.25;',
+      '  }',
+      '  gl_FragColor=vec4(pow(col,vec3(0.4545)),uAlpha);',
+      '}'
+    ].join('\n');
+  }
+  function compile(type, src) {
+    var sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) || '着色器编译失败');
+    return sh;
+  }
+  function initGL() {
+    glError = '';
+    prog = null;
+    canvas.width = L.w;
+    canvas.height = L.h;
+    try {
+      gl = gl || canvas.getContext('webgl', { antialias: false, alpha: false, powerPreference: 'high-performance' });
+      if (!gl) throw new Error('这个浏览器不支持图形加速');
+      var pr = gl.createProgram();
+      gl.attachShader(pr, compile(gl.VERTEX_SHADER, VERT));
+      gl.attachShader(pr, compile(gl.FRAGMENT_SHADER, fragSource(L.steps, L.iter)));
+      gl.linkProgram(pr);
+      if (!gl.getProgramParameter(pr, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(pr) || '着色器链接失败');
+      gl.useProgram(pr);
+      var buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+      var loc = gl.getAttribLocation(pr, 'p');
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+      uRes = gl.getUniformLocation(pr, 'uRes');
+      uAng = gl.getUniformLocation(pr, 'uAng');
+      gl.viewport(0, 0, L.w, L.h);
+      gl.uniform2f(uRes, L.w, L.h);
+      gl.uniform1f(gl.getUniformLocation(pr, 'uAlpha'), 1.0);
+      if (L.burn) { gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); }
+      else gl.disable(gl.BLEND);
+      passes = 1;
+      prog = pr;
+    } catch (e) {
+      glError = String(e && e.message || e);
+    }
+    $('res').textContent = L.w + ' × ' + L.h;
+  }
+  canvas.addEventListener('webglcontextlost', function (e) { e.preventDefault(); prog = null; glError = '图形中断，正在恢复'; });
+  canvas.addEventListener('webglcontextrestored', function () { initGL(); });
+
+  var TAU = Math.PI * 2;
+  var lastDraw = 0, frames = 0, fpsFrom = 0, fpsNow = 0;
+  function frame(ts) {
+    requestAnimationFrame(frame);
+    if (!prog || L.burn) return;
+    if (ts - lastDraw < 1000 / L.fps - 2) return;
+    lastDraw = ts;
+    var sec = ts / 1000;
+    gl.uniform3f(uAng, (sec * 0.11) % TAU, (sec * 0.07) % TAU, (sec * 0.23) % TAU);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    frames++;
+    if (ts - fpsFrom >= 2000) { fpsNow = frames * 1000 / (ts - fpsFrom); frames = 0; fpsFrom = ts; }
+  }
+
+  // Full power: draw a batch, wait until the chip has really finished it, size the next batch
+  // to take about BATCH_MS, and start it straight away.
+  var BATCH_MS = 50, MAX_PASSES = 50000;
+  var px = new Uint8Array(4), burnCount = 0, burnFrom = 0;
+  var chan = (typeof MessageChannel !== 'undefined') ? new MessageChannel() : null;
+  function again(ms) {
+    if (chan && !ms) chan.port2.postMessage(0); else setTimeout(burn, ms || 0);
+  }
+  function burn() {
+    if (!L.burn || !prog || document.visibilityState !== 'visible') { again(250); return; }
+    var t0 = performance.now(), sec = t0 / 1000;
+    gl.uniform3f(uAng, (sec * 0.11) % TAU, (sec * 0.07) % TAU, (sec * 0.23) % TAU);
+    for (var i = 0; i < passes; i++) gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);   // blocks until the batch is done
+    var t1 = performance.now(), dt = Math.max(t1 - t0, 0.25);
+    burnCount += passes;
+    if (!burnFrom) burnFrom = t0;
+    if (t1 - burnFrom >= 1000) { fpsNow = burnCount * 1000 / (t1 - burnFrom); burnCount = 0; burnFrom = t1; }
+    var want = passes * BATCH_MS / dt;
+    passes = Math.max(1, Math.min(MAX_PASSES, Math.round(Math.min(want, passes * 8))));
+    again(0);
+  }
+  if (chan) chan.port1.onmessage = burn;
+
+  // ---------- readouts ----------
+  function renderRows() {
+    var body = $('rows');
+    body.textContent = '';
+    runs.slice(-5).reverse().forEach(function (r) {
+      var tr = document.createElement('tr');
+      if (r === cur) tr.className = 'now';
+      [stamp(r.start), dur(r.last - r.start) + (r === cur ? ' 进行中' : ''), (LEVELS[r.level] || {}).name || r.level]
+        .forEach(function (txt) { var td = document.createElement('td'); td.textContent = txt; tr.appendChild(td); });
+      body.appendChild(tr);
+    });
+  }
+  function renderLevel() {
+    Object.keys(LEVELS).forEach(function (k) { $('lv-' + k).setAttribute('aria-pressed', String(k === levelKey)); });
+  }
+  var lastBeat = 0, lastRows = 0;
+  function tick() {
+    if (document.visibilityState !== 'visible') return;
+    var now = Date.now();
+    touchRun(now);
+    $('clock').textContent = dur(now - cur.start);
+    $('started').textContent = stamp(cur.start);
+    $('fps').textContent = L.burn
+      ? (fpsNow ? Math.round(fpsNow) + ' 遍/秒' : '--')
+      : (fpsNow ? fpsNow.toFixed(0) : '--') + ' / ' + L.fps + ' 帧';
+    $('res').textContent = L.w + ' × ' + L.h + (L.burn ? '，每批 ' + passes + ' 遍' : '');
+    var st = $('state');
+    if (glError) { st.dataset.state = 'bad'; st.textContent = glError; }
+    else if (!fpsNow) { st.dataset.state = ''; st.textContent = '正在启动'; }
+    else if (L.burn) { st.dataset.state = 'max'; st.textContent = '全力运行'; }
+    else if (fpsNow >= L.fps * 0.9) { st.dataset.state = 'ok'; st.textContent = '负荷稳定'; }
+    else { st.dataset.state = 'max'; st.textContent = '已到设备上限，可降一档'; }
+    if (now - lastBeat >= BEAT_MS) { lastBeat = now; saveRuns(); }
+    if (now - lastRows >= 5000) { lastRows = now; renderRows(); }
+    if (!saved) $('note').textContent = '这个浏览器不允许保存，记录在关闭页面后会丢失。';
+  }
+
+  // ---------- controls ----------
+  function applyLevel(k) {
+    if (!LEVELS[k] || k === levelKey) return;
+    levelKey = k; L = LEVELS[k];
+    store.set('level', k);
+    fpsNow = 0; frames = 0; fpsFrom = performance.now(); burnCount = 0; burnFrom = 0;
+    initGL();
+    setWorkers(L.workers);
+    startRun(Date.now());
+    renderLevel(); renderRows();
+  }
+  Object.keys(LEVELS).forEach(function (k) {
+    $('lv-' + k).addEventListener('click', function () {
+      applyLevel(k);
+      try { location.hash = k; } catch (e) {}
+    });
+  });
+  window.addEventListener('hashchange', function () { applyLevel((location.hash || '').replace('#', '')); });
+
+  $('copy').addEventListener('click', function () {
+    var text = csv(), btn = $('copy');
+    function fallback() {
+      var ta = $('dump'); ta.hidden = false; ta.value = text; ta.focus(); ta.select();
+      $('note').textContent = '无法自动复制。上面的框里是全部记录，长按全选后复制。';
+    }
+    try {
+      navigator.clipboard.writeText(text).then(function () {
+        btn.textContent = '已复制';
+        setTimeout(function () { btn.textContent = '复制全部记录'; }, 1500);
+      }, fallback);
+    } catch (e) { fallback(); }
+  });
+  var armed = 0;
+  $('clear').addEventListener('click', function () {
+    var btn = $('clear');
+    if (Date.now() - armed < 4000) {
+      runs = []; cur = null; startRun(Date.now()); renderRows();
+      armed = 0; btn.textContent = '清空';
+    } else {
+      armed = Date.now(); btn.textContent = '再点一次确认';
+      setTimeout(function () { if (armed) { armed = 0; btn.textContent = '清空'; } }, 4000);
+    }
+  });
+
+  // keep the screen on where the browser allows it; Auto-Lock "Never" is the real guarantee
+  function wake() { try { navigator.wakeLock.request('screen').catch(function () {}); } catch (e) {} }
+  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'visible') wake(); });
+
+  // ---------- go ----------
+  renderLevel();
+  initGL();
+  setWorkers(L.workers);
+  renderRows();
+  wake();
+  tick();
+  setInterval(tick, 500);
+  requestAnimationFrame(frame);
+  again(0);
+})();
+</script>
+</body>
+</html>
