@@ -264,7 +264,7 @@ textarea {
       'setTimeout(tick,' + rest + ');}tick();';
   }
   function setWorkers(n) {
-    var src = n < 0 ? workerSrc(190, 10) : workerSrc(80, 20);
+    var src = n < 0 ? workerSrc(1000, 0) : workerSrc(80, 20);   // full power: threads never rest
     if (n < 0) n = Math.max(2, navigator.hardwareConcurrency || 4);
     workers.forEach(function (w) { try { w.terminate(); } catch (e) {} });
     workers = [];
